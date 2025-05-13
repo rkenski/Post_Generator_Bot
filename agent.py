@@ -65,7 +65,7 @@ class SlidePlan:
     suggested_assets: List[str] = field(default_factory=list)
 
 # ---------------------------------------------------------------------------
-# Canva API helpers (unchanged except we rename camelCase)
+# Canva API helpers
 # ---------------------------------------------------------------------------
 CANVA_BASE = "https://api.canva.com/v1"
 
@@ -340,3 +340,30 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# Import os module if needed elsewhere in the code
+import os
+# API credentials should be loaded from environment variables or a secure configuration file
+# rather than hardcoded in the source code
+
+
+'''
+args = argparse.Namespace(
+    prompt_json="data/aqi/prompts/prompts.json",
+    style_guideline="data/aqi/style_guidelines/style_guidelines.md",
+    brand_id="aqi",
+    assets_dir="data/aqi/assets",
+    assets_manifest="data/aqi/assets_manifest.json",
+    output_dir="data/aqi/output"
+)
+'''
+'''
+Example:
+python agent.py \
+    --prompt_json data/aqi/prompts/prompts.json \
+    --style_guideline data/aqi/style_guidelines/style_guidelines.md \
+    --brand_id aqi \
+    --assets_manifest data/aqi/assets_manifest_prod.json \
+    --output_dir data/aqi/output
+'''
+'''
