@@ -1,8 +1,10 @@
-# instagram_carousel.py — v0.2
+# instagram_carousel.py — v0.3
 """AI Agent for Generating On‑Brand Instagram Carousels (revised)
 
-Changelog v0.2 (2025‑05‑07)
+Changelog v0.3 (2025‑05‑13)
 ──────────────────────────
+• **Local asset management** – Removed Canva API dependency, now uses local
+  folders for fonts, logos, and shape assets
 • **Asset catalogue** – 209 brand PNG/SVG shape assets can now be loaded from a
   folder or a JSON manifest.  The agent scores each asset against the slide copy
   (Portuguese‑aware) and picks the best‑matching ones.
@@ -32,6 +34,7 @@ import pathlib
 import random
 import re
 import textwrap
+from openai import OpenAI
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
@@ -49,8 +52,8 @@ from PIL import Image, ImageDraw, ImageFont
 @dataclass
 class BrandKit:
     primary_colors: List[str]
-    fonts: Dict[str, str]  # style → font path/URL
-    logos: Dict[str, str]  # variant → URL
+    fonts: Dict[str, str]  # style → font path
+    logos: Dict[str, str]  # variant → path
     extra_assets: Dict[str, str]
 
 @dataclass
@@ -58,7 +61,8 @@ class Asset:
     """Visual element (PNG/SVG) that can decorate a slide."""
 
     name: str
-    tags: List[str]
+    description: str
+    use_cases: List[str]
     path_or_url: str
 
 @dataclass
@@ -69,63 +73,88 @@ class SlidePlan:
     suggested_assets: List[str] = field(default_factory=list)
 
 # ---------------------------------------------------------------------------
-# Canva API helpers
+# Local brand kit loading
 # ---------------------------------------------------------------------------
-CANVA_API_BASE = "https://api.canva.com/v1"
-CANVA_BRANDS_BASE = f"{CANVA_API_BASE}/brands"
-
-def _canva_headers() -> Dict[str, str]:
-    # Using credentials and secret key from environment variables
-    return {
-        "Credentials": os.environ['CANVA_CREDENTIAL'],
-        "Secret-Key": os.environ['CANVA_SECRET_KEY'],
-        "Content-Type": "application/json"
-    }
-brand_id = 'kAGml1BxmuI'
-def fetch_brand_kit(brand_id: str) -> BrandKit:
-    # Try the main endpoint structure
-    resp = requests.get(f"{CANVA_BRANDS_BASE}/{brand_id}", headers=_canva_headers(), timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+def load_brand_kit(brand_id: str) -> BrandKit:
+    """Load brand kit from local directories instead of Canva API."""
+    # Base path for the brand assets
+    base_path = pathlib.Path(f"data/{brand_id}")
     
-    # Extract brand kit data from the response
-    # Note: The actual structure may need adjustment based on the actual API response
-    return BrandKit(
-        primary_colors=[c.get("hex", "#000000") for c in data.get("colors", [])],
-        fonts={f.get("style", f"font_{i}"): f.get("download_url", "") for i, f in enumerate(data.get("fonts", []))},
-        logos={l.get("variant", f"logo_{i}"): l.get("download_url", "") for i, l in enumerate(data.get("logos", []))},
-        extra_assets={a.get("name", f"asset_{i}"): a.get("download_url", "") for i, a in enumerate(data.get("assets", []))},
-    )
-
-# ---------------------------------------------------------------------------
-def fetch_folder_contents(folder_id: str) -> List[Dict]:
-    """
-    Access a folder with the given ID and return its contents.
-    This function attempts to access a folder in Canva using the folder ID.
+    # Define primary colors - these could be loaded from a config file
+    primary_colors = ["#1D3C34", "#F2F2F2", "#D4C19C", "#F24C3D"]
     
-    Args:
-        folder_id: The ID of the folder to access
+    # Load fonts from the fonts directory
+    fonts_dir = base_path / "fonts"
+    fonts = {}
+    
+    # Process all font directories
+    if fonts_dir.exists():
+        # First, find all available font files (both TTF and OTF) across all font directories
+        all_fonts = list(fonts_dir.glob("**/*.ttf")) + list(fonts_dir.glob("**/*.otf"))
+        heading_fonts = [f for f in all_fonts if "bold" in f.name.lower()]
+        body_fonts = [f for f in all_fonts if "bold" not in f.name.lower()]
         
-    Returns:
-        A list of dictionaries containing information about the folder contents
-    """
-    try:
-        # Try accessing folder endpoint (the exact endpoint may need adjustment)
-        folder_endpoint = f"{CANVA_API_BASE}/folders/{folder_id}/contents"
-        resp = requests.get(folder_endpoint, headers=_canva_headers(), timeout=30)
-        resp.raise_for_status()
-        return resp.json().get("contents", [])
-    except Exception as e:
-        print(f"Error accessing folder {folder_id}: {e}")
-        # Try alternative endpoint structure if the first one fails
-        try:
-            alt_endpoint = f"{CANVA_API_BASE}/resources/{folder_id}"
-            resp = requests.get(alt_endpoint, headers=_canva_headers(), timeout=30)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as alt_e:
-            print(f"Error with alternative endpoint for folder {folder_id}: {alt_e}")
-            return []
+        # Map font styles to specific font families if possible
+        font_families = {}
+        for font_dir in fonts_dir.iterdir():
+            if font_dir.is_dir():
+                family_name = font_dir.name.lower()
+                # Include both TTF and OTF fonts
+                family_fonts = list(font_dir.glob("*.ttf")) + list(font_dir.glob("*.otf"))
+                if family_fonts:
+                    font_families[family_name] = family_fonts
+        
+        # Assign heading font - prefer 'abordage' bold or any bold font
+        if "abordage" in font_families and any("bold" in f.name.lower() for f in font_families["abordage"]):
+            fonts["heading"] = str(next(f for f in font_families["abordage"] if "bold" in f.name.lower()))
+        elif heading_fonts:
+            fonts["heading"] = str(heading_fonts[0])
+        elif all_fonts:
+            fonts["heading"] = str(all_fonts[0])
+        
+        # Assign body font - prefer 'cantata one', then 'compagnon', then any non-bold font
+        if "cantata one" in font_families:
+            fonts["body"] = str(font_families["cantata one"][0])
+        elif "compagnon" in font_families:
+            # For compagnon, prefer regular style if available
+            compagnon_regular = next((f for f in font_families["compagnon"] if "regular" in f.name.lower()), None)
+            if compagnon_regular:
+                fonts["body"] = str(compagnon_regular)
+            else:
+                fonts["body"] = str(font_families["compagnon"][0])
+        elif body_fonts:
+            fonts["body"] = str(body_fonts[0])
+        elif all_fonts and all_fonts != [fonts.get("heading")]:
+            fonts["body"] = str(all_fonts[0])
+            
+        # Add a third font style for captions or other elements if needed
+        if "compagnon" in font_families and "body" in fonts and not fonts["body"].endswith(font_families["compagnon"][0].name):
+            fonts["caption"] = str(font_families["compagnon"][0])
+    
+    # Load logos from the logos directory
+    logos_dir = base_path / "logos"
+    logos = {}
+    
+    if logos_dir.exists():
+        # Find primary logo (preferring PNG format)
+        primary_logos = list(logos_dir.glob("*nominal*.png"))
+        if primary_logos:
+            logos["primary"] = str(primary_logos[0])
+        else:
+            # Fallback to any PNG logo
+            all_logos = list(logos_dir.glob("*.png"))
+            if all_logos:
+                logos["primary"] = str(all_logos[0])
+    
+    # Extra assets could be loaded from a separate directory if needed
+    extra_assets = {}
+    
+    return BrandKit(
+        primary_colors=primary_colors,
+        fonts=fonts,
+        logos=logos,
+        extra_assets=extra_assets,
+    )
 
 # Asset catalogue & selection
 # ---------------------------------------------------------------------------
@@ -136,7 +165,7 @@ def load_asset_catalogue(assets_dir: str | None = None, manifest: str | None = N
     if manifest:
         data = json.loads(pathlib.Path(manifest).read_text("utf‑8"))
         for item in data:
-            catalogue.append(Asset(name=item["name"], tags=item["tags"], path_or_url=item["path"]))
+            catalogue.append(Asset(name=item["name"], description=item["description"], use_cases=item["use_cases"], path_or_url=item["path"]))
     elif assets_dir:
         for fp in pathlib.Path(assets_dir).glob("*.png"):
             tags = re.split(r"[_\-]", fp.stem)  # crude tokenisation on filename
@@ -147,70 +176,48 @@ def load_asset_catalogue(assets_dir: str | None = None, manifest: str | None = N
 
 # ------------- Asset scoring helpers ------------- #
 
-try:
-    from openai import OpenAI  # type: ignore
-    _OPENAI = OpenAI()
-except ModuleNotFoundError:
-    _OPENAI = None  # offline mode
-
-
-def pick_assets_for_slide(copy_text: str, assets: Sequence[Asset], top_k: int = 3) -> List[Asset]:
+def pick_assets_for_slide(copy_text: str, assets: Sequence[Asset], top_k: int = 3, model: str = "gpt-4.1-2025-04-14") -> List[Asset]:
     """Return the best‑fitting decorative assets for this copy block."""
     if _OPENAI:
         # Ask GPT‑4o to choose asset names (fast, accurate)
-        sys_prompt = "Você é um designer de marcas. Escolha os 3 elementos visuais que melhor reforçam a mensagem do slide, considerando as opções disponíveis (nomes dos arquivos). Responda apenas com uma lista em JSON: [\"asset1\", \"asset2\", ...]."
+        sys_prompt = "Você é um designer de mídias sociais. Escolha os 3 elementos visuais que melhor reforçam a mensagem do slide, considerando as opções disponíveis (nomes dos arquivos). Responda apenas com uma lista em JSON: [\"asset1\", \"asset2\", ...]."
         asset_names = [a.name for a in assets]
         payload = {
-            "model": "gpt‑4o‑mini",
+            "model": model,
             "messages": [
                 {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": f"COPIA DO SLIDE:\n{copy_text}\n\nOPÇÕES DE ASSET:\n{', '.join(asset_names)}"},
+                {"role": "user", "content": f"COPIA DO SLIDE:\n{copy_text}\n\nOPÇÕES DE ASSET:\n{str(data)}"},
             ],
             "temperature": 0.2,
         }
-        try:
-            r = _OPENAI.chat.completions.create(**payload)  # type: ignore[attr-defined]
-            chosen = json.loads(r.choices[0].message.content)
-            return [a for a in assets if a.name in chosen][:top_k]
-        except Exception:
-            # fall back if LLM fails
-            pass
-
-    # Offline fallback – bag‑of‑words Jaccard similarity
-    from collections import Counter
-    import math
-
-    def tokenise(s: str) -> set[str]:
-        return set(re.findall(r"[\wÀ-ÿ]+", s.lower()))
-
-    tokens = tokenise(copy_text)
-    scored = []
-    for a in assets:
-        score = len(tokens.intersection(set(a.tags))) / (len(tokens) + 1e-3)
-        scored.append((score, a))
-    scored.sort(reverse=True, key=lambda x: x[0])
-    return [a for _, a in scored[:top_k]]
+        r = _OPENAI.chat.completions.create(**payload)  # type: ignore[attr-defined]
+        chosen = json.loads(r.choices[0].message.content)
+        return [a for a in assets if a.path_or_url in chosen][:top_k]
 
 # ---------------------------------------------------------------------------
 # LLM content plan (minor localisation tweaks)
 # ---------------------------------------------------------------------------
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
-def create_content_plan(prompt: str, style_md: str, copies: List[str]) -> List[SlidePlan]:
+def create_content_plan(main_prompt: str, style_md: str, copies: List[str], model: str) -> List[SlidePlan]:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
     system_prompt = (
         "Você é um diretor de arte senior. Gere um plano JSON para um carrossel do Instagram, definindo para cada slide os campos heading (título/subtítulo curto) e body (texto corrido). Use exatamente, sem alterar, o copy fornecido. Segue guia de estilo:\n" + style_md
     )
-    payload = {
-        "model": "gpt‑4o‑mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(copies, ensure_ascii=False)},
-        ],
-        "temperature": 0.3,
-    }
-    r = requests.post(OPENAI_CHAT_URL, headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}", "Content-Type": "application/json"}, json=payload, timeout=60)
-    r.raise_for_status()
-    raw_plan = json.loads(r.json()["choices"][0]["message"]["content"])
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": " ".join(main_prompt)},
+        {"role": "user", "content": json.dumps(copies, ensure_ascii=False)},
+    ]
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.3,
+        response_format={"type": "json_object"}
+    )
+    content = response.choices[0].message.content
+    raw_plan = json.loads(content)
     plan: List[SlidePlan] = []
     for idx, p in enumerate(raw_plan, start=1):
         plan.append(SlidePlan(slide=idx, heading=p["heading"], body=p["body"]))
@@ -221,19 +228,22 @@ def create_content_plan(prompt: str, style_md: str, copies: List[str]) -> List[S
 # ---------------------------------------------------------------------------
 
 def generate_background_images(num: int, brand: BrandKit) -> List[Image.Image]:
-    from openai import OpenAI  # type: ignore
-
-    client = OpenAI()
-    imgs: List[Image.Image] = []
-    for _ in range(num):
-        try:
-            prompt = f"Abstract minimal background in brand palette {', '.join(brand.primary_colors[:2])}, soft shapes, flat design, 4K"
-            res = client.images.generate(prompt=prompt, n=1, size="1024x1024")
-            img_bytes = requests.get(res.data[0].url, timeout=30).content
-            imgs.append(Image.open(io.BytesIO(img_bytes)).convert("RGBA"))
-        except Exception:
-            imgs.append(Image.new("RGBA", (1080, 1080), brand.primary_colors[0]))
-    return imgs
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI()
+        imgs: List[Image.Image] = []
+        for _ in tqdm(range(num)):
+            try:
+                prompt = f"Abstract minimal background in brand palette {', '.join(brand.primary_colors[:2])}, soft shapes, flat design, 4K"
+                res = client.images.generate(prompt=prompt, n=1, size="1024x1024")
+                img_bytes = requests.get(res.data[0].url, timeout=30).content
+                imgs.append(Image.open(io.BytesIO(img_bytes)).convert("RGBA"))
+            except Exception:
+                imgs.append(Image.new("RGBA", (1080, 1080), brand.primary_colors[0]))
+        return imgs
+    except Exception:
+        # Fallback to solid color backgrounds if OpenAI is not available
+        return [Image.new("RGBA", (1080, 1080), color) for color in brand.primary_colors[:num]]
 
 # ---------------------------------------------------------------------------
 # Layout & composition
@@ -242,24 +252,36 @@ def generate_background_images(num: int, brand: BrandKit) -> List[Image.Image]:
 _ANCHORS = [(60, 60), (800, 50), (50, 700), (700, 700)]  # where to drop decorative assets
 
 
-def compose_slide(plan: SlidePlan, bg: Image.Image, brand: BrandKit, catalogue: Sequence[Asset]) -> Image.Image:
+def compose_slide(plan: SlidePlan,
+                    bg: Image.Image,
+                    brand: BrandKit,
+                    catalogue: Sequence[Asset],
+                    model: str = 'gpt-4.1-2025-04-14') -> Image.Image:
     """Compose slide with copy and chosen decorative assets."""
     slide = bg.resize((1080, 1080)).copy()
     draw = ImageDraw.Draw(slide)
 
     # Heading
-    heading_font_path = _ensure_font(brand, "heading")
-    heading_font = ImageFont.truetype(heading_font_path, size=92)
+    heading_font_path = brand.fonts.get("heading")
+    if not heading_font_path:
+        # Fallback to default font
+        heading_font = ImageFont.load_default()
+    else:
+        heading_font = ImageFont.truetype(heading_font_path, size=92)
     draw.text((80, 180), plan.heading, font=heading_font, fill=brand.primary_colors[1])
 
     # Body text (auto‑wrap to 35 chars)
-    body_font_path = _ensure_font(brand, "body")
-    body_font = ImageFont.truetype(body_font_path, size=48)
+    body_font_path = brand.fonts.get("body")
+    if not body_font_path:
+        # Fallback to default font
+        body_font = ImageFont.load_default()
+    else:
+        body_font = ImageFont.truetype(body_font_path, size=48)
     wrapped = textwrap.fill(plan.body, width=35)
     draw.text((80, 380), wrapped, font=body_font, fill="#3d3d3d")
 
     # Decorative assets
-    chosen_assets = pick_assets_for_slide(plan.heading + " " + plan.body, catalogue)
+    chosen_assets = pick_assets_for_slide(plan.heading + " " + plan.body, catalogue, model)
     plan.suggested_assets = [a.name for a in chosen_assets]
     for anchor, asset in zip(_ANCHORS, chosen_assets):
         try:
@@ -269,10 +291,13 @@ def compose_slide(plan: SlidePlan, bg: Image.Image, brand: BrandKit, catalogue: 
             continue
 
     # Logo bottom‑right
-    logo_path = download_asset(brand.logos.get("primary"))
+    logo_path = brand.logos.get("primary")
     if logo_path:
-        logo = Image.open(logo_path).convert("RGBA").resize((120, 120))
-        slide.alpha_composite(logo, dest=(900, 900))
+        try:
+            logo = Image.open(logo_path).convert("RGBA").resize((120, 120))
+            slide.alpha_composite(logo, dest=(900, 900))
+        except Exception:
+            pass  # Skip logo if it can't be loaded
 
     return slide
 
@@ -288,29 +313,6 @@ def _open_asset(path_or_url: str, max_size: int = 350) -> Image.Image:
     if scale > 1:
         img = img.resize((int(img.width / scale), int(img.height / scale)))
     return img
-
-
-def _ensure_font(brand: BrandKit, style: str) -> str:
-    url = brand.fonts.get(style)
-    if not url:
-        raise ValueError(f"Missing font style {style}")
-    cache = pathlib.Path(".cache/fonts")
-    cache.mkdir(parents=True, exist_ok=True)
-    dst = cache / pathlib.Path(url).name
-    if not dst.exists():
-        dst.write_bytes(requests.get(url, timeout=30).content)
-    return str(dst)
-
-
-def download_asset(url: str | None) -> str | None:
-    if not url:
-        return None
-    cache = pathlib.Path(".cache/assets")
-    cache.mkdir(parents=True, exist_ok=True)
-    dst = cache / pathlib.Path(url).name
-    if not dst.exists():
-        dst.write_bytes(requests.get(url, timeout=30).content)
-    return str(dst)
 
 # ---------------------------------------------------------------------------
 # Export helpers
@@ -331,8 +333,8 @@ def export_slides(slides: List[Image.Image], out_dir: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def build_carousel(prompt_json: str, style_file: str, brand_id: str, assets_dir: str | None, assets_manifest: str | None, out_dir: str) -> None:
-    # No need for token, using credentials and secret key from environment variables
-    brand = fetch_brand_kit(brand_id)
+    # Load brand kit from local files instead of Canva API
+    brand = load_brand_kit(brand_id)
 
     # Input prompt & copies
     prompt_data = json.loads(pathlib.Path(prompt_json).read_text("utf‑8"))
@@ -341,12 +343,16 @@ def build_carousel(prompt_json: str, style_file: str, brand_id: str, assets_dir:
 
     style_md = pathlib.Path(style_file).read_text("utf‑8")
 
-    plan = create_content_plan(main_prompt, style_md, copies)
+    plan = create_content_plan(main_prompt, style_md, copies, model)
     bgs = generate_background_images(len(plan), brand)
 
+    # If assets_dir is not provided, use the default location
+    if not assets_dir and not assets_manifest:
+        assets_dir = f"data/{brand_id}/shapes/png"
+    
     catalogue = load_asset_catalogue(assets_dir, assets_manifest)
 
-    slides = [compose_slide(p, bg, brand, catalogue) for p, bg in zip(plan, bgs)]
+    slides = [compose_slide(p, bg, brand, catalogue, model) for p, bg in zip(plan[:1], bgs[:1])]
     exported = export_slides(slides, out_dir)
 
     print("\nExported slides:")
@@ -363,7 +369,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--prompt_json", required=True)
     p.add_argument("--style_guideline", required=True)
     p.add_argument("--brand_id", required=True)
-    group = p.add_mutually_exclusive_group(required=True)
+    group = p.add_mutually_exclusive_group(required=False)  # Changed to not required
     group.add_argument("--assets_dir")
     group.add_argument("--assets_manifest")
     p.add_argument("--output_dir", default="./output")
@@ -389,13 +395,22 @@ if __name__ == "__main__":
 """
 args = argparse.Namespace(
     prompt_json="data/aqi/prompts/prompts.json",
-    style_guideline="data/aqi/style_guidelines/style_guidelines.md",
+    style_guideline="data/aqi/examples/brand_guidelines.md",
     brand_id="aqi",
-    assets_dir="data/aqi/assets",
-    assets_manifest="data/aqi/assets_manifest.json",
+    assets_dir="data/aqi/shapes/png",
+    assets_manifest="data/aqi/shapes/assets_manifest_prod.json",
     output_dir="data/aqi/output"
 )
 """
+
+prompt_json="data/aqi/prompts/prompts.json"
+style_file="data/aqi/examples/brand_guidelines.md"
+brand_id="aqi"
+assets_dir="data/aqi/shapes/png"
+assets_manifest="data/aqi/shapes/assets_manifest_prod.json"
+output_dir=out_dir = "data/aqi/output"
+model = 'gpt-4.1-2025-04-14'
+
 
 # Example command line usage:
 """
@@ -404,10 +419,17 @@ python agent.py \
     --prompt_json data/aqi/prompts/prompts.json \
     --style_guideline data/aqi/style_guidelines/style_guidelines.md \
     --brand_id aqi \
-    --assets_manifest data/aqi/assets_manifest_prod.json \
+    --assets_dir data/aqi/shapes/png \
     --output_dir data/aqi/output
 """
 
-# Example of setting environment variables (commented out)
-# import os
-# os.environ['OPENAI_API_KEY'] = 'your-key-here'
+# Alternative command line usage with assets manifest:
+"""
+Example:
+python agent.py \
+    --prompt_json data/aqi/prompts/prompts.json \
+    --style_guideline data/aqi/style_guidelines/style_guidelines.md \
+    --brand_id aqi \
+    --assets_manifest data/aqi/shapes/assets_manifest_prod.json \
+    --output_dir data/aqi/output
+"""
